@@ -17,6 +17,7 @@ from interfaces import nipype_interface_phaseweights as phaseweights
 from interfaces import nipype_interface_makehomogeneous as makehomogeneous
 from interfaces import nipype_interface_nonzeroaverage as nonzeroaverage
 from interfaces import nipype_interface_twopass as twopass
+from interfaces import nipype_interface_threshold as threshold
 
 import argparse
 
@@ -96,6 +97,9 @@ def init_run_workflow(subject, session, run):
     params_pattern = os.path.join(args.bids_dir, args.phase_pattern.format(subject=subject, session=session, run=run).replace("nii.gz", "nii").replace("nii", "json"))
     params_files = sorted(glob.glob(params_pattern))[:args.num_echoes_to_process]
 
+    t1_pattern = os.path.join(args.bids_dir, args.t1_pattern.format(subject=subject, session=session, run=run))
+    t1_files = glob.glob(t1_pattern)
+
     masking = args.masking
     add_bet = args.add_bet
     inhomogeneity_correction = args.inhomogeneity_correction
@@ -104,10 +108,15 @@ def init_run_workflow(subject, session, run):
     if not phase_files:
         print(f"Warning for {subject}/{session}/{run}: No phase files found matching pattern: {phase_pattern}. Skipping run...")
         return
+    if not t1_files:
+        print(f"No T1w files matching pattern: {t1_pattern}")
+        exit()
+    if len(t1_files) > 1:
+        print(f"QSMxT: Warning: Multiple T1w files matching pattern {t1_pattern}")
     if len(phase_files) != len(params_files):
         print(f"Warning for {subject}/{session}/{run}: An unequal number of JSON and phase files are present. Skipping run...")
         return
-    if (not magnitude_files and any([masking == 'magnitude-based', masking == 'bet', add_bet, inhomogeneity_correction])):
+    if (not (magnitude_files or t1_files) and any([masking == 'gaussian-based', masking == 'magnitude-based', masking == 'bet', add_bet, inhomogeneity_correction])):
         print(f"Warning for {subject}/{session}/{run}: No magnitude files found matching pattern: {magnitude_pattern}. Reverting to phase-based masking for this run.")
         masking = 'phase-based'
         add_bet = False
@@ -116,13 +125,14 @@ def init_run_workflow(subject, session, run):
     # get files
     n_getfiles = Node(
         IdentityInterface(
-            fields=['phase_files', 'magnitude_files', 'params_files']
+            fields=['phase_files', 'magnitude_files', 'params_files', 't1_files']
         ),
         name='nipype_getfiles'
     )
     n_getfiles.inputs.phase_files = phase_files
     n_getfiles.inputs.magnitude_files = magnitude_files
     n_getfiles.inputs.params_files = params_files
+    n_getfiles.inputs.t1_files = t1_files
 
     # datasink
     n_datasink = Node(
@@ -292,9 +302,39 @@ def init_run_workflow(subject, session, run):
         wf.connect([
             (mn_magmask, mn_mask, [('out_file', 'in_file')])
         ])
+
+    elif masking == 'gaussian-based':
+        n_threshold = Node(
+            interface=threshold.ThresholdInterface(),
+            iterfield=['in_file'],
+            name='threshold-t1'
+        )
+        mn_gaussmask = MapNode(
+                interface=ImageMaths(
+                    suffix="_mask"
+                ),
+                iterfield=['in_file', 'op_string'],
+                name='fslmaths_gaussian-mask'
+                # output: 'out_file'
+            )
+
+        if inhomogeneity_correction:
+            wf.connect([
+                (n_threshold, mn_gaussmask, [('op_string', 'op_string')]),
+                (mn_inhomogeneity_correction, mn_gaussmask, [('out_file', 'in_file')])
+            ])
+        else:
+            wf.connect([
+                (n_getfiles, mn_gaussmask, [('t1_files', 'in_file')])
+            ])
+
+        wf.connect([
+            (mn_gaussmask, mn_mask, [('out_file', 'in_file')])
+        ])  
+
     
     # QSM reconstruction
-    if args.two_pass or masking == 'bet':
+    if args.two_pass or masking in ['bet', 'gaussian-based']:
         mn_qsm = MapNode(
             interface=tgv.QSMappingInterface(
                 iterations=args.qsm_iterations,
@@ -498,6 +538,13 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        '--t1_pattern',
+        default='{subject}/{session}/anat/*{run}*_T1w*nii*',
+        help='Pattern to match phase files for qsm within session folders. ' +
+             'The {subject}, {session} and {run} placeholders must be present.'
+    )
+
+    parser.add_argument(
         '--subjects',
         default=None,
         nargs='*',
@@ -522,7 +569,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--masking', '-m',
         default='magnitude-based',
-        choices=['magnitude-based', 'phase-based', 'bet'],
+        choices=['magnitude-based', 'phase-based', 'bet', 'gaussian-based'],
         help='Masking strategy. Magnitude-based and phase-based masking generates a mask by ' +
              'thresholding a lower percentage of the histogram of the signal (adjust using the '+
              '--threshold parameter). For phase-based masking, the spatial phase coherence is '+
@@ -548,7 +595,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--inhomogeneity_correction',
         action='store_true',
-        help='Applies an inomogeneity correction to the magnitude prior to masking'
+        help='Applies an inhomogeneity correction to the magnitude prior to masking'
     )
 
     parser.add_argument(

@@ -3,8 +3,8 @@ import nibabel as nib
 import numpy as np
 from scipy.stats import norm
 import matplotlib.pyplot as plt
-from nipype.interfaces.base import SimpleInterface, BaseInterfaceInputSpec, TraitedSpec, File
-from nipype.interfaces.fsl import ImageMaths
+from nipype.interfaces.base import SimpleInterface, BaseInterfaceInputSpec, TraitedSpec, File, traits
+
 
 def histogram(image, normalize):
     image = image.flatten()
@@ -17,7 +17,7 @@ def histogram(image, normalize):
         hist = hist / np.sum(hist)
     return hist, bin_centers, mean, std
 
-def thresholding(in_file, out_file=None):
+def thresholding(in_file, op_string=None):
     nii_file = nib.load(in_file)
     array = nii_file.get_fdata()
     hist, bin, mu, std = histogram(array, True)
@@ -26,18 +26,16 @@ def thresholding(in_file, out_file=None):
     maxpoint = max(range(len(difference)), key=difference.__getitem__)
     threshold = bin[maxpoint]/np.amax(array)*100
 
-    out_file =  ImageMaths(
-                suffix='_mask',
-                op_string=f'-thrp {threshold} -bin -ero -dilM'
-            )
-    return out_file
+    op_string =  '-thrp {threshold} -bin -ero -dilM'.format(threshold=threshold)
+    return op_string
+
 
 class ThresholdInputSpec(BaseInterfaceInputSpec):
     in_file = File(mandatory=True, exists=True)
 
 
 class ThresholdOutputSpec(TraitedSpec):
-    out_file = File()
+    op_string = traits.String()
 
 
 class ThresholdInterface(SimpleInterface):
@@ -45,7 +43,7 @@ class ThresholdInterface(SimpleInterface):
     output_spec = ThresholdOutputSpec
 
     def _run_interface(self, runtime):
-        self._results['out_file'] = thresholding(self.inputs.in_file)
+        self._results['op_string'] = thresholding(self.inputs.in_file)
         return runtime
 
 
@@ -58,4 +56,14 @@ if __name__ == "__main__":
         type=str
     )
 
+    parser.add_argument(
+        'op_string',
+        nargs='?',
+        default=None,
+        const=None,
+        type=str
+    )
+
+    args = parser.parse_args()
+    op_string = thresholding(args.in_file, args.op_string)
     
